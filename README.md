@@ -19,6 +19,8 @@ The production design uses:
 
 The coding exercise deliberately uses in-memory state and a lock because the brief explicitly permits that and says the implementation need not be production-grade.
 
+Per the interviewer's note that an actual database isn't required, resolved applications are also appended as JSON lines to a local placeholder file (`applications.jsonl`, git-ignored) via an injectable `persist` callback on `LicenseAllocator`. It defaults to a no-op so the unit tests stay in-memory-only; `Program.cs` wires the real file writer. See `docs/interview-walkthrough.md` for the trade-off discussion against making the file itself the consistency boundary.
+
 ## Run
 
 Requires .NET 8 SDK.

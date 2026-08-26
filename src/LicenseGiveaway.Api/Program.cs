@@ -1,7 +1,28 @@
+using System.Text.Json;
+
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
-var allocator = new LicenseAllocator(totalLicenses: 1_000);
+// Placeholder-file persistence, per the interviewer's note that an actual
+// database isn't required. One JSON line is appended per resolved
+// application; a real implementation would make this write part of the same
+// transaction as allocation (e.g. a DB row), not a best-effort side effect.
+// Guarded by its own lock since concurrent writers would otherwise race on
+// the file handle — kept separate from the allocator's allocation lock so a
+// slow/blocked write can never serialize behind license allocation itself.
+var applicationsFilePath = Path.Combine(AppContext.BaseDirectory, "applications.jsonl");
+var fileLock = new object();
+
+var allocator = new LicenseAllocator(
+    totalLicenses: 1_000,
+    persist: view =>
+    {
+        var json = JsonSerializer.Serialize(view);
+        lock (fileLock)
+        {
+            File.AppendAllText(applicationsFilePath, json + Environment.NewLine);
+        }
+    });
 
 app.MapPost("/applications", (LicenseApplicationRequest request) =>
 {
@@ -92,17 +113,24 @@ public sealed class LicenseAllocator
     private readonly int _totalLicenses;
     private int _allocatedLicenses;
     private long _nextSequence;
+    private readonly Action<ApplicationView> _persist;
 
     private readonly HashSet<string> _licensedEmails = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _licensedPhones = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, ApplicationView> _applications = new();
 
-    public LicenseAllocator(int totalLicenses)
+    /// <param name="persist">
+    /// Called with the resolved record for every application, outside the
+    /// allocation lock. Defaults to a no-op so unit tests stay in-memory only
+    /// and don't touch disk; Program.cs wires a real placeholder-file writer.
+    /// </param>
+    public LicenseAllocator(int totalLicenses, Action<ApplicationView>? persist = null)
     {
         if (totalLicenses <= 0)
             throw new ArgumentOutOfRangeException(nameof(totalLicenses));
 
         _totalLicenses = totalLicenses;
+        _persist = persist ?? (_ => { });
     }
 
     public ApplicationResult Apply(string email, string phone)
@@ -119,6 +147,7 @@ public sealed class LicenseAllocator
 
         ApplicationStatus status;
         string? licenseCode = null;
+        ApplicationView view;
 
         lock (_gate)
         {
@@ -140,18 +169,24 @@ public sealed class LicenseAllocator
                 status = ApplicationStatus.Accepted;
             }
 
-            _applications[applicationId] = status == ApplicationStatus.Accepted
+            view = status == ApplicationStatus.Accepted
                 ? new ApplicationView(
                     applicationId, normalizedEmail, normalizedPhone, sequence,
                     "Allocated", licenseCode, "Generating")
                 : new ApplicationView(
                     applicationId, normalizedEmail, normalizedPhone, sequence,
                     "Rejected", null, "NotApplicable");
+
+            _applications[applicationId] = view;
         }
 
-        // Stub dispatched after releasing the lock: a real implementation enqueues a
-        // durable PDF-generation job here. Keeping it outside the critical section
-        // means a slow or failing PDF job never serializes behind license allocation.
+        // Both dispatched after releasing the lock: a real implementation would make
+        // the persistence write part of the same transaction as allocation (a DB row),
+        // and enqueue a durable PDF-generation job. Keeping both outside the critical
+        // section means a slow write or failing PDF job never serializes behind or
+        // jeopardizes license allocation itself.
+        _persist(view);
+
         if (status == ApplicationStatus.Accepted)
         {
             GeneratePdfStub(applicationId, licenseCode!);

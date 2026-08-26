@@ -185,6 +185,38 @@ exactly why they're decoupled. The PDF job retries independently; status stays
 `PdfGenerating` until it succeeds, or moves to a `PdfFailed` state with retry/backoff
 if attempts are exhausted, without ever touching the allocation count.
 
+### Persistence ("no DB required, a placeholder file is fine")
+
+**Q: You're writing to a file now — walk me through that.**
+A: `LicenseAllocator` takes an optional `persist` callback, defaulting to a no-op so
+the unit tests stay in-memory-only and hermetic. `Program.cs`, as the composition
+root, wires a real one that appends one JSON line per resolved application to
+`applications.jsonl`. It's called after the lock releases, for the same reason the PDF
+stub is dispatched there — a slow or blocked file write should never serialize behind
+or jeopardize the actual allocation decision. It's guarded by its own separate lock
+purely to stop concurrent writers from colliding on the file handle; that lock has
+nothing to do with allocation correctness.
+
+**Q: Doesn't writing after the lock releases mean you could lose a record — allocate in memory, then crash before the file write happens?**
+A: Yes, and that's a real, honest gap in this stub — the in-memory dictionary and the
+file can drift if the process dies between them. I chose this trade-off because it
+keeps the already-tested allocation path completely untouched. The alternative — call
+it Option A — is to make the file itself the consistency boundary: replace the
+`Dictionary`/`HashSet` entirely with a JSON file, load it at startup, and rewrite it
+*inside* the same lock as the allocation decision (via a temp-file-plus-atomic-rename
+write, the same way you'd think about a DB transaction). That's the more faithful
+answer to "use a file instead of a DB" — the file *is* the durability boundary — but it
+reworks the allocation path I already have concurrency-tested, so I didn't take that on
+given the time box. I can implement it live if you want to see it.
+
+**Q: Which would you actually ship?**
+A: Neither, exactly — in production this becomes the RDS/DynamoDB conditional-write
+transaction from Part A. Between the two exercise-scale options, Option A is the more
+honest answer to the specific instruction ("use a file instead of a DB"), since it
+makes the file the actual boundary rather than a best-effort echo of one. I defaulted
+to the safer stub here because I'd rather show you correct, tested allocation logic
+than risk introducing a new bug in the last few minutes reworking it.
+
 ### Scope / trade-offs
 
 **Q: What would you build next if given another hour?**
